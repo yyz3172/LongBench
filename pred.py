@@ -55,6 +55,45 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
         print("Max tries. Failed.")
         return ''
 
+def _longbench_v2_row(item):
+    row = {
+        "_id": item["_id"],
+        "domain": item["domain"],
+        "sub_domain": item["sub_domain"],
+        "difficulty": item["difficulty"],
+        "length": item["length"],
+        "question": item["question"],
+        "choice_A": item["choice_A"],
+        "choice_B": item["choice_B"],
+        "choice_C": item["choice_C"],
+        "choice_D": item["choice_D"],
+        "answer": item["answer"],
+        "context": item["context"],
+    }
+    if "retrieved_context" in item:
+        row["retrieved_context"] = item["retrieved_context"]
+    return row
+
+
+def load_data_all(data_json_path):
+    """从本地文件加载 LongBench-v2，避免依赖 Hugging Face 在线下载。"""
+    if data_json_path.endswith(".jsonl"):
+        with open(data_json_path, encoding="utf-8") as f:
+            items = [json.loads(line) for line in f if line.strip()]
+    else:
+        with open(data_json_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict) and "train" in raw:
+            items = raw["train"]
+        else:
+            raise ValueError(
+                "本地 JSON 应为对象列表，或形如 {\"train\": [...] } 的字典"
+            )
+    return [_longbench_v2_row(x) for x in items]
+
+
 def extract_answer(response):
     response = response.replace('*', '')
     match = re.search(r'The correct answer is \(([A-D])\)', response)
@@ -124,8 +163,11 @@ def main():
     else:
         out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + ".jsonl")
 
-    dataset = load_dataset('THUDM/LongBench-v2', split='train') # dataset = json.load(open('data.json', 'r', encoding='utf-8'))
-    data_all = [{"_id": item["_id"], "domain": item["domain"], "sub_domain": item["sub_domain"], "difficulty": item["difficulty"], "length": item["length"], "question": item["question"], "choice_A": item["choice_A"], "choice_B": item["choice_B"], "choice_C": item["choice_C"], "choice_D": item["choice_D"], "answer": item["answer"], "context": item["context"]} for item in dataset]
+    if args.data_json:
+        data_all = load_data_all(args.data_json)
+    else:
+        dataset = load_dataset("THUDM/LongBench-v2", split="train")
+        data_all = [_longbench_v2_row(item) for item in dataset]
 
     # cache
     has_data = {}
@@ -155,5 +197,11 @@ if __name__ == "__main__":
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
     parser.add_argument("--n_proc", "-n", type=int, default=16)
+    parser.add_argument(
+        "--data_json",
+        type=str,
+        default=None,
+        help="本地数据路径（.json 数组或 {\"train\": [...]}，或 .jsonl），不设则从 Hugging Face 下载 THUDM/LongBench-v2",
+    )
     args = parser.parse_args()
     main()
