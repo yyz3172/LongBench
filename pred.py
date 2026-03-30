@@ -34,18 +34,34 @@ template_0shot_cot = open('prompts/0shot_cot.txt', encoding='utf-8').read()
 template_0shot_cot_ans = open('prompts/0shot_cot_ans.txt', encoding='utf-8').read()
 
 def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_tokens=128, stop=None):
-    # truncate
-    max_len = maxlen_map[model]
-    if model in model_map:
-        input_ids = tokenizer.encode(prompt)
-        if len(input_ids) > max_len:
-            input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
-            prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
-    else:
-        input_ids = tokenizer.encode(prompt, disallowed_special=())
-        if len(input_ids) > max_len:
-            input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
-            prompt = tokenizer.decode(input_ids)
+    # vLLM 的 ChatCompletions 会套 chat template（role / special tokens），
+    # 实际送入模型的 input_ids 会比 messages[0]["content"] 多一些 token。
+    # 这里预留余量，避免“只超出几 token”导致 400。
+    CHAT_TEMPLATE_BUFFER_TOKENS = 256
+
+    def _encode(text):
+        if model in model_map:
+            return tokenizer.encode(text)
+        return tokenizer.encode(text, disallowed_special=())
+
+    def _decode(ids):
+        if model in model_map:
+            return tokenizer.decode(ids, skip_special_tokens=True)
+        return tokenizer.decode(ids)
+
+    def _truncate(text, limit):
+        input_ids = _encode(text)
+        if len(input_ids) <= limit:
+            return text
+        # 保留头尾，适合 LongBench 的长上下文
+        keep = max(limit, 0)
+        half = keep // 2
+        input_ids = input_ids[:half] + input_ids[-(keep - half):]
+        return _decode(input_ids)
+
+    # truncate（以本地配置为上限；预留 chat template 余量；若服务端更小，后面会自动适配）
+    max_len = max(256, maxlen_map[model] - CHAT_TEMPLATE_BUFFER_TOKENS)
+    prompt = _truncate(prompt, max_len)
     tries = 0
     api_model = _api_model_id(model) if model in model_map else model
     while tries < 5:
@@ -65,15 +81,33 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
             print(f'Error Occurs: "{msg}"        Retry ...')
             # 尽量打印服务端返回，方便定位 500 的具体原因（如超长上下文、模型名不匹配、并发过高等）
             resp = getattr(e, "response", None)
+            body_text = None
             if resp is not None:
                 try:
                     status = getattr(resp, "status_code", None)
                     text = getattr(resp, "text", None)
                     if callable(text):
                         text = text()
+                    body_text = text
                     print(f"[server_response] status={status} body={text}")
                 except Exception:
                     pass
+            # vLLM 常见报错：最大上下文长度不足（400），自动把 prompt 截断到服务端上限再重试
+            # 例如：This model's maximum context length is 8192 tokens. However, your request has 120009 input tokens.
+            err_text = body_text or msg
+            m = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
+            if m:
+                server_limit = int(m.group(1))
+                # 预留 chat template 余量，避免再次越界（无需扣 max_new_tokens：这里只影响 input tokens）
+                new_limit = max(256, server_limit - CHAT_TEMPLATE_BUFFER_TOKENS)
+                if new_limit < max_len:
+                    max_len = new_limit
+                    prompt = _truncate(prompt, max_len)
+                    print(
+                        f"[data] server max context={server_limit}, "
+                        f"auto-truncate to {max_len} (buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
+                    )
+                    continue
             time.sleep(1)
     else:
         print("Max tries. Failed.")

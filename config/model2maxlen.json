@@ -1,5 +1,7 @@
 {
     "GLM-4-9B-Chat": 120000,
+    "internlm2_5-7b-chat-1m": 1000000,
+    "Mistral-7B-Instruct-v0.2": 32768,
     "Meta-Llama-3-8B-Instruct": 120000,
     "Llama-3.1-8B-Instruct": 120000,
     "Llama-3.1-70B-Instruct": 120000,

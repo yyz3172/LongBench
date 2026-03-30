@@ -1,5 +1,13 @@
 {
     "GLM-4-9B-Chat": "THUDM/glm-4-9b-chat",
+    "internlm2_5-7b-chat-1m": {
+        "tokenizer": "/root/autodl-tmp/models/internlm2_5-7b-chat-1m",
+        "api_model": "internlm2_5_7b_chat_1m"
+    },
+    "Mistral-7B-Instruct-v0.2": {
+        "tokenizer": "/root/autodl-tmp/models/Mistral-7B-Instruct-v0.2",
+        "api_model": "mistral_7b_instruct_v0_2"
+    },
     "Meta-Llama-3-8B-Instruct": {
         "tokenizer": "/root/autodl-tmp/models/Meta-Llama-3-8B-Instruct",
         "api_model": "meta_llama3_8b_instruct"
