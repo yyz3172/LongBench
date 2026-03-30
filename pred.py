@@ -3,6 +3,7 @@ import argparse
 import time
 import urllib.request
 import urllib.error
+from typing import Optional, Tuple, Dict, Any
 from tqdm import tqdm
 import re
 from openai import OpenAI
@@ -72,8 +73,9 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
                 max_tokens=max_new_tokens,
+                stream=False,
             )
-            return completion.choices[0].message.content
+            return completion.choices[0].message.content, None
         except KeyboardInterrupt as e:
             raise e
         except Exception as e:
@@ -111,7 +113,137 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
             time.sleep(1)
     else:
         print("Max tries. Failed.")
-        return ''
+        return '', None
+
+
+def query_llm_streaming(
+    prompt: str,
+    model: str,
+    tokenizer,
+    client=None,
+    temperature: float = 0.5,
+    max_new_tokens: int = 128,
+    stop=None,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    使用 OpenAI 兼容的 stream=True 来统计 TTFT / E2E。
+    注意：TTFT 是“客户端视角”的首 chunk 到达延迟，包含网络与服务端排队/预处理。
+    """
+    # 复用 query_llm 的截断策略（保持一致）
+    # vLLM 的 ChatCompletions 会套 chat template（role / special tokens）
+    CHAT_TEMPLATE_BUFFER_TOKENS = 256
+
+    def _encode(text):
+        if model in model_map:
+            return tokenizer.encode(text)
+        return tokenizer.encode(text, disallowed_special=())
+
+    def _decode(ids):
+        if model in model_map:
+            return tokenizer.decode(ids, skip_special_tokens=True)
+        return tokenizer.decode(ids)
+
+    def _truncate(text, limit):
+        input_ids = _encode(text)
+        if len(input_ids) <= limit:
+            return text
+        keep = max(limit, 0)
+        half = keep // 2
+        input_ids = input_ids[:half] + input_ids[-(keep - half):]
+        return _decode(input_ids)
+
+    max_len = max(256, maxlen_map[model] - CHAT_TEMPLATE_BUFFER_TOKENS)
+    prompt = _truncate(prompt, max_len)
+
+    api_model = _api_model_id(model) if model in model_map else model
+    start = time.perf_counter()
+    first_chunk_t: Optional[float] = None
+    text_parts = []
+    tries = 0
+
+    while tries < 5:
+        tries += 1
+        try:
+            stream = client.chat.completions.create(
+                model=api_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                now = time.perf_counter()
+                if first_chunk_t is None:
+                    first_chunk_t = now
+                # 兼容不同 SDK / 服务端的 chunk 结构
+                delta = None
+                try:
+                    delta = chunk.choices[0].delta
+                except Exception:
+                    delta = None
+                if delta is not None:
+                    content = getattr(delta, "content", None)
+                    if content:
+                        text_parts.append(content)
+                else:
+                    # fallback：有些实现可能直接给 message/content
+                    try:
+                        msg = chunk.choices[0].message
+                        if msg and getattr(msg, "content", None):
+                            text_parts.append(msg.content)
+                    except Exception:
+                        pass
+            end = time.perf_counter()
+            out = "".join(text_parts)
+            metrics = {
+                "ttft_ms": (first_chunk_t - start) * 1000 if first_chunk_t else None,
+                "e2e_ms": (end - start) * 1000,
+            }
+            return out, metrics
+        except KeyboardInterrupt as e:
+            raise e
+        except Exception as e:
+            msg = str(e) or repr(e)
+            print(f'Error Occurs: "{msg}"        Retry ...')
+            resp = getattr(e, "response", None)
+            body_text = None
+            if resp is not None:
+                try:
+                    status = getattr(resp, "status_code", None)
+                    text = getattr(resp, "text", None)
+                    if callable(text):
+                        text = text()
+                    body_text = text
+                    print(f"[server_response] status={status} body={text}")
+                except Exception:
+                    pass
+            err_text = body_text or msg
+            m = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
+            if m:
+                server_limit = int(m.group(1))
+                new_limit = max(256, server_limit - CHAT_TEMPLATE_BUFFER_TOKENS)
+                if new_limit < max_len:
+                    max_len = new_limit
+                    prompt = _truncate(prompt, max_len)
+                    print(
+                        f"[data] server max context={server_limit}, "
+                        f"auto-truncate to {max_len} (buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
+                    )
+                    continue
+            time.sleep(1)
+
+    return "", {"ttft_ms": None, "e2e_ms": None}
+
+
+def _count_tokens_text(text: str, model_key: str, tokenizer) -> int:
+    if not text:
+        return 0
+    try:
+        if model_key in model_map:
+            return len(tokenizer.encode(text))
+        return len(tokenizer.encode(text, disallowed_special=()))
+    except Exception:
+        return 0
 
 def _longbench_v2_row(item):
     row = {
@@ -229,38 +361,70 @@ def get_pred(data, args, fout):
         else:
             template = template_0shot
         prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
-        if args.cot:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+        if args.measure_latency:
+            if args.cot:
+                output, metrics = query_llm_streaming(
+                    prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024
+                )
+            else:
+                output, metrics = query_llm_streaming(
+                    prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128
+                )
         else:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            if args.cot:
+                output, metrics = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+            else:
+                output, metrics = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+
         if output == '':
             continue
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            if args.measure_latency:
+                output, metrics2 = query_llm_streaming(
+                    prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128
+                )
+            else:
+                output, metrics2 = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
             if output == '':
                 continue
+            # COT 模式下有两段请求：记录两段的 TTFT/E2E
+            item["ttft_ms_cot"] = metrics.get("ttft_ms") if metrics else None
+            item["e2e_ms_cot"] = metrics.get("e2e_ms") if metrics else None
+            metrics = metrics2
         response = output.strip()
         item['response'] = response
         item['pred'] = extract_answer(response)
         item['judge'] = item['pred'] == item['answer']
         item['context'] = context[:1000]
+        if metrics:
+            item["ttft_ms"] = metrics.get("ttft_ms")
+            item["e2e_ms"] = metrics.get("e2e_ms")
+            out_tok = _count_tokens_text(response, model, tokenizer)
+            item["output_tokens"] = out_tok
+            ttft = metrics.get("ttft_ms")
+            e2e = metrics.get("e2e_ms")
+            if isinstance(ttft, (int, float)) and isinstance(e2e, (int, float)) and out_tok > 0 and e2e >= ttft:
+                item["tpot_ms"] = (e2e - ttft) / out_tok
+            else:
+                item["tpot_ms"] = None
         fout.write(json.dumps(item, ensure_ascii=False) + '\n')
         fout.flush()
 
 def main():
     os.makedirs(args.save_dir, exist_ok=True)
     print(args)
+    name = args.model.split("/")[-1]
+    suffix = f"_batch_{args.n_proc}"
     if args.rag > 0:
-        out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + f"_rag_{str(args.rag)}.jsonl")
+        name = name + f"_rag_{str(args.rag)}"
     elif args.no_context:
-        out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + "_no_context.jsonl")
+        name = name + "_no_context"
     elif args.cot:
-        out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + "_cot.jsonl")
-    else:
-        out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + ".jsonl")
+        name = name + "_cot"
+    out_file = os.path.join(args.save_dir, name + suffix + ".jsonl")
 
     data_all = _load_longbench_v2_data(args)
 
@@ -292,6 +456,12 @@ if __name__ == "__main__":
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
     parser.add_argument("--n_proc", "-n", type=int, default=16)
+    parser.add_argument(
+        "--measure_latency",
+        dest="measure_latency",
+        action="store_true",
+        help="启用 stream=True 统计 TTFT（首 chunk 延迟）与 E2E（端到端时延），并写入 results/*.jsonl",
+    )
     parser.add_argument(
         "--data_path",
         type=str,
