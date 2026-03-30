@@ -26,7 +26,18 @@ def _api_model_id(model_key):
         return v.get("api_model", v["tokenizer"])
     return v
 
-URL = "http://127.0.0.1:8000/v1"
+def _default_base_url() -> str:
+    # 兼容 PD 分离：可通过环境变量覆盖端口/整条 base_url
+    # - OPENAI_BASE_URL: 例如 "http://127.0.0.1:9010/v1"
+    # - VLLM_PORT: 例如 "9010"（将拼成 http://127.0.0.1:<port>/v1）
+    v = os.environ.get("OPENAI_BASE_URL")
+    if v:
+        return v
+    port = os.environ.get("VLLM_PORT", "8000")
+    return f"http://127.0.0.1:{port}/v1"
+
+
+URL = _default_base_url()
 API_KEY = "token-abc123"
 template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
 template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
@@ -416,15 +427,21 @@ def get_pred(data, args, fout):
 def main():
     os.makedirs(args.save_dir, exist_ok=True)
     print(args)
-    name = args.model.split("/")[-1]
-    suffix = f"_batch_{args.n_proc}"
-    if args.rag > 0:
-        name = name + f"_rag_{str(args.rag)}"
-    elif args.no_context:
-        name = name + "_no_context"
-    elif args.cot:
-        name = name + "_cot"
-    out_file = os.path.join(args.save_dir, name + suffix + ".jsonl")
+    if args.out_file:
+        out_name = args.out_file
+        if not out_name.endswith(".jsonl"):
+            out_name = out_name + ".jsonl"
+        out_file = os.path.join(args.save_dir, out_name)
+    else:
+        name = args.model.split("/")[-1]
+        suffix = f"_batch_{args.n_proc}"
+        if args.rag > 0:
+            name = name + f"_rag_{str(args.rag)}"
+        elif args.no_context:
+            name = name + "_no_context"
+        elif args.cot:
+            name = name + "_cot"
+        out_file = os.path.join(args.save_dir, name + suffix + ".jsonl")
 
     data_all = _load_longbench_v2_data(args)
 
@@ -452,6 +469,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_dir", "-s", type=str, default="results")
     parser.add_argument("--model", "-m", type=str, default="GLM-4-9B-Chat")
+    parser.add_argument(
+        "--out_file",
+        type=str,
+        default=None,
+        help="可选：指定输出文件名（位于 --save_dir 下）。不传则按原逻辑自动生成；未写 .jsonl 会自动补齐。",
+    )
     parser.add_argument("--cot", "-cot", action='store_true') # set to True if using COT
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
