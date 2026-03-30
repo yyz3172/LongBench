@@ -1,8 +1,9 @@
 import os, csv, json
 import argparse
 import time
+import urllib.request
+import urllib.error
 from tqdm import tqdm
-from datasets import load_dataset
 import re
 from openai import OpenAI
 from transformers import AutoTokenizer
@@ -11,6 +12,18 @@ import torch.multiprocessing as mp
 
 model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
 maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
+
+
+def _tokenizer_path(model_key):
+    v = model_map[model_key]
+    return v["tokenizer"] if isinstance(v, dict) else v
+
+
+def _api_model_id(model_key):
+    v = model_map[model_key]
+    if isinstance(v, dict):
+        return v.get("api_model", v["tokenizer"])
+    return v
 
 URL = "http://127.0.0.1:8000/v1"
 API_KEY = "token-abc123"
@@ -34,13 +47,12 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
             input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
             prompt = tokenizer.decode(input_ids)
     tries = 0
-    if model in model_map:
-        model = model_map[model]
+    api_model = _api_model_id(model) if model in model_map else model
     while tries < 5:
         tries += 1
         try:
             completion = client.chat.completions.create(
-                model=model,
+                model=api_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
                 max_tokens=max_new_tokens,
@@ -49,7 +61,19 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
         except KeyboardInterrupt as e:
             raise e
         except Exception as e:
-            print("Error Occurs: \"%s\"        Retry ..."%(str(e)))
+            msg = str(e) or repr(e)
+            print(f'Error Occurs: "{msg}"        Retry ...')
+            # 尽量打印服务端返回，方便定位 500 的具体原因（如超长上下文、模型名不匹配、并发过高等）
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    status = getattr(resp, "status_code", None)
+                    text = getattr(resp, "text", None)
+                    if callable(text):
+                        text = text()
+                    print(f"[server_response] status={status} body={text}")
+                except Exception:
+                    pass
             time.sleep(1)
     else:
         print("Max tries. Failed.")
@@ -94,6 +118,47 @@ def load_data_all(data_json_path):
     return [_longbench_v2_row(x) for x in items]
 
 
+def _resolve_data_path(args):
+    """
+    统一将 --data_path 解析为“具体文件路径”：
+    - 传目录：默认使用 <dir>/data.json
+    - 传文件：直接使用该文件
+    """
+    if not args.data_path:
+        raise SystemExit("请显式传入 --data_path（data.json/.jsonl 文件或包含 data.json 的目录）")
+
+    if os.path.isdir(args.data_path):
+        return os.path.join(args.data_path, "data.json")
+    return args.data_path
+
+
+def _download_longbench_v2_data_json(dst_file):
+    """
+    直接把 LongBench-v2 的 data.json 下载到 dst_file，不走 HF 缓存目录。
+    支持通过环境变量 HF_ENDPOINT 设置镜像站点（例如 https://hf-mirror.com）。
+    """
+    base = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+    url = f"{base}/datasets/THUDM/LongBench-v2/resolve/main/data.json"
+    os.makedirs(os.path.dirname(dst_file) or ".", exist_ok=True)
+    print(f"[data] local file not found, downloading: {url} -> {dst_file}")
+    try:
+        urllib.request.urlretrieve(url, dst_file)
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"下载失败：HTTP {e.code}，url={url}") from e
+    except urllib.error.URLError as e:
+        raise SystemExit(f"下载失败：网络错误，url={url} err={e}") from e
+    print(f"[data] download complete: {dst_file}")
+
+
+def _load_longbench_v2_data(args):
+    data_file = _resolve_data_path(args)
+    if not os.path.exists(data_file):
+        _download_longbench_v2_data_json(data_file)
+    else:
+        print(f"[data] using local dataset file: {data_file}")
+    return load_data_all(data_file)
+
+
 def extract_answer(response):
     response = response.replace('*', '')
     match = re.search(r'The correct answer is \(([A-D])\)', response)
@@ -111,7 +176,7 @@ def get_pred(data, args, fout):
     if "gpt" in model or "o1" in model:
         tokenizer = tiktoken.encoding_for_model("gpt-4o-2024-08-06")
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_map[model], trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(_tokenizer_path(model), trust_remote_code=True)
     client = OpenAI(
         base_url=URL,
         api_key=API_KEY
@@ -163,11 +228,7 @@ def main():
     else:
         out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + ".jsonl")
 
-    if args.data_json:
-        data_all = load_data_all(args.data_json)
-    else:
-        dataset = load_dataset("THUDM/LongBench-v2", split="train")
-        data_all = [_longbench_v2_row(item) for item in dataset]
+    data_all = _load_longbench_v2_data(args)
 
     # cache
     has_data = {}
@@ -198,10 +259,10 @@ if __name__ == "__main__":
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
     parser.add_argument("--n_proc", "-n", type=int, default=16)
     parser.add_argument(
-        "--data_json",
+        "--data_path",
         type=str,
-        default=None,
-        help="本地数据路径（.json 数组或 {\"train\": [...]}，或 .jsonl），不设则从 Hugging Face 下载 THUDM/LongBench-v2",
+        required=True,
+        help="数据路径：可为 data.json/.jsonl 文件，或一个目录（将使用 <dir>/data.json）。若文件不存在会自动下载到此处。",
     )
     args = parser.parse_args()
     main()

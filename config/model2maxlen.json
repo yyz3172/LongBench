@@ -1,5 +1,6 @@
 {
     "GLM-4-9B-Chat": 120000,
+    "Meta-Llama-3-8B-Instruct": 120000,
     "Llama-3.1-8B-Instruct": 120000,
     "Llama-3.1-70B-Instruct": 120000,
     "Llama-3.3-70B-Instruct": 120000,

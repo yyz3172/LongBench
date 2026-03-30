@@ -1,5 +1,9 @@
 {
     "GLM-4-9B-Chat": "THUDM/glm-4-9b-chat",
+    "Meta-Llama-3-8B-Instruct": {
+        "tokenizer": "/root/autodl-tmp/models/Meta-Llama-3-8B-Instruct",
+        "api_model": "meta_llama3_8b_instruct"
+    },
     "Llama-3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct", 
     "Llama-3.1-70B-Instruct": "meta-llama/Llama-3.1-70B-Instruct",
     "Llama-3.3-70B-Instruct": "meta-llama/Llama-3.3-70B-Instruct",
