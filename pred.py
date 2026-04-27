@@ -26,6 +26,72 @@ def _api_model_id(model_key):
         return v.get("api_model", v["tokenizer"])
     return v
 
+
+def _encode_text_for_model(text: str, model_key: str, tokenizer):
+    if model_key in model_map:
+        return tokenizer.encode(text)
+    return tokenizer.encode(text, disallowed_special=())
+
+
+def _decode_ids_for_model(ids, model_key: str, tokenizer) -> str:
+    if model_key in model_map:
+        return tokenizer.decode(ids, skip_special_tokens=True)
+    return tokenizer.decode(ids)
+
+
+def _truncate_head_tokens(text: str, limit_tokens: int, model_key: str, tokenizer) -> str:
+    """按 token 头部截断（只保留前 limit_tokens 个 token）。"""
+    keep = max(int(limit_tokens), 0)
+    if keep <= 0:
+        return ""
+    ids = _encode_text_for_model(text, model_key, tokenizer)
+    if len(ids) <= keep:
+        return text
+    return _decode_ids_for_model(ids[:keep], model_key, tokenizer)
+
+
+def build_prompt_truncating_context_head(
+    *,
+    template: str,
+    context: str,
+    question: str,
+    c_a: str,
+    c_b: str,
+    c_c: str,
+    c_d: str,
+    model_key: str,
+    tokenizer,
+    max_prompt_len_tokens: int,
+) -> str:
+    """
+    仅裁剪 context（$DOC$）的头部保留策略：
+    - 先把模板中除 $DOC$ 以外的字段都替换掉，得到 prefix/suffix 的固定开销
+    - 将剩余 token 预算全部分配给 context，并且只保留 context 的前半段
+    - 若模板中无 $DOC$，则不做 context 裁剪，直接返回完整替换后的 prompt
+    """
+    # 先替换除 $DOC$ 外的占位符，确保 token 开销计算包含题干与选项等“固定部分”
+    t = (
+        template.replace("$Q$", (question or "").strip())
+        .replace("$C_A$", (c_a or "").strip())
+        .replace("$C_B$", (c_b or "").strip())
+        .replace("$C_C$", (c_c or "").strip())
+        .replace("$C_D$", (c_d or "").strip())
+    )
+    if "$DOC$" not in t:
+        return t
+    prefix, suffix = t.split("$DOC$", 1)
+    fixed = prefix + suffix
+    fixed_tokens = len(_encode_text_for_model(fixed, model_key, tokenizer))
+    ctx_budget = int(max_prompt_len_tokens) - fixed_tokens
+    if ctx_budget <= 0:
+        raise ValueError(
+            f"Prompt fixed part already exceeds token budget: "
+            f"fixed_tokens={fixed_tokens} max_prompt_len_tokens={int(max_prompt_len_tokens)} "
+            f"(model={model_key})."
+        )
+    ctx = _truncate_head_tokens((context or "").strip(), ctx_budget, model_key, tokenizer)
+    return prefix + ctx + suffix
+
 def _default_base_url() -> str:
     # 兼容 PD 分离：可通过环境变量覆盖端口/整条 base_url
     # - OPENAI_BASE_URL: 例如 "http://127.0.0.1:9010/v1"
@@ -51,31 +117,6 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
     # 这里预留余量，避免“只超出几 token”导致 400。
     CHAT_TEMPLATE_BUFFER_TOKENS = 256
 
-    def _encode(text):
-        if model in model_map:
-            return tokenizer.encode(text)
-        return tokenizer.encode(text, disallowed_special=())
-
-    def _decode(ids):
-        if model in model_map:
-            return tokenizer.decode(ids, skip_special_tokens=True)
-        return tokenizer.decode(ids)
-
-    def _truncate(text, limit):
-        input_ids = _encode(text)
-        if len(input_ids) <= limit:
-            return text
-        # 保留头尾，适合 LongBench 的长上下文
-        keep = max(limit, 0)
-        half = keep // 2
-        input_ids = input_ids[:half] + input_ids[-(keep - half):]
-        return _decode(input_ids)
-
-    # truncate（以“输入 tokens + 生成 tokens”不超过 max_model_len 为准；预留 chat template 余量）
-    # 否则 vLLM 会直接 400：max_tokens 太大（例如 1024 > max_len - input_tokens）
-    max_model_len = int(maxlen_map[model])
-    max_prompt_len = max(256, max_model_len - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
-    prompt = _truncate(prompt, max_prompt_len)
     tries = 0
     api_model = _api_model_id(model) if model in model_map else model
     while tries < 5:
@@ -111,17 +152,12 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
             err_text = body_text or msg
             m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
             if m_ctx:
+                # 只做一次裁剪（上游已按 context 预算裁剪）；若仍超限则直接失败，避免二次裁剪改变评测语义
                 server_limit = int(m_ctx.group(1))
-                # 关键：要扣掉 max_new_tokens（否则仍可能触发“max_tokens 太大”）
-                new_prompt_limit = max(256, server_limit - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
-                if new_prompt_limit < max_prompt_len:
-                    max_prompt_len = new_prompt_limit
-                    prompt = _truncate(prompt, max_prompt_len)
-                    print(
-                        f"[data] server max context={server_limit}, "
-                        f"auto-truncate prompt to {max_prompt_len} (max_new_tokens={max_new_tokens}, buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
-                    )
-                    continue
+                print(
+                    f"[data] server max context={server_limit}; prompt still exceeds limit after context truncation. Skip."
+                )
+                return "", None
             time.sleep(1)
     else:
         print("Max tries. Failed.")
@@ -141,32 +177,8 @@ def query_llm_streaming(
     使用 OpenAI 兼容的 stream=True 来统计 TTFT / E2E。
     注意：TTFT 是“客户端视角”的首 chunk 到达延迟，包含网络与服务端排队/预处理。
     """
-    # 复用 query_llm 的截断策略（保持一致）
     # vLLM 的 ChatCompletions 会套 chat template（role / special tokens）
     CHAT_TEMPLATE_BUFFER_TOKENS = 256
-
-    def _encode(text):
-        if model in model_map:
-            return tokenizer.encode(text)
-        return tokenizer.encode(text, disallowed_special=())
-
-    def _decode(ids):
-        if model in model_map:
-            return tokenizer.decode(ids, skip_special_tokens=True)
-        return tokenizer.decode(ids)
-
-    def _truncate(text, limit):
-        input_ids = _encode(text)
-        if len(input_ids) <= limit:
-            return text
-        keep = max(limit, 0)
-        half = keep // 2
-        input_ids = input_ids[:half] + input_ids[-(keep - half):]
-        return _decode(input_ids)
-
-    max_model_len = int(maxlen_map[model])
-    max_prompt_len = max(256, max_model_len - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
-    prompt = _truncate(prompt, max_prompt_len)
 
     api_model = _api_model_id(model) if model in model_map else model
     start = time.perf_counter()
@@ -234,15 +246,10 @@ def query_llm_streaming(
             m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
             if m_ctx:
                 server_limit = int(m_ctx.group(1))
-                new_prompt_limit = max(256, server_limit - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
-                if new_prompt_limit < max_prompt_len:
-                    max_prompt_len = new_prompt_limit
-                    prompt = _truncate(prompt, max_prompt_len)
-                    print(
-                        f"[data] server max context={server_limit}, "
-                        f"auto-truncate prompt to {max_prompt_len} (max_new_tokens={max_new_tokens}, buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
-                    )
-                    continue
+                print(
+                    f"[data] server max context={server_limit}; prompt still exceeds limit after context truncation. Skip."
+                )
+                return "", {"ttft_ms": None, "e2e_ms": None}
             time.sleep(1)
 
     return "", {"ttft_ms": None, "e2e_ms": None}
@@ -373,7 +380,31 @@ def get_pred(data, args, fout):
             template = template_0shot_cot
         else:
             template = template_0shot
-        prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
+        # 预截断策略调整：
+        # - 大部分超长来自 context，因此按 token 预算只裁剪 $DOC$（context）的头部
+        # - 预算 = max_model_len - max_new_tokens - chat_template_buffer - 固定字段开销
+        CHAT_TEMPLATE_BUFFER_TOKENS = 256
+        max_model_len = int(maxlen_map[model])
+        # CoT 第一段生成更长，因此 max_new_tokens 更大；第二段/非 CoT 用较小值
+        max_new_tokens = 1024 if args.cot else 128
+        max_prompt_len = max(256, max_model_len - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
+        try:
+            prompt = build_prompt_truncating_context_head(
+                template=template,
+                context=context,
+                question=item["question"],
+                c_a=item["choice_A"],
+                c_b=item["choice_B"],
+                c_c=item["choice_C"],
+                c_d=item["choice_D"],
+                model_key=model,
+                tokenizer=tokenizer,
+                max_prompt_len_tokens=max_prompt_len,
+            )
+        except ValueError as e:
+            _id = item.get("_id")
+            print(f"[data] skip item due to prompt budget error: _id={_id} err={e}")
+            continue
         if args.measure_latency:
             if args.cot:
                 output, metrics = query_llm_streaming(
@@ -411,7 +442,7 @@ def get_pred(data, args, fout):
         item['response'] = response
         item['pred'] = extract_answer(response)
         item['judge'] = item['pred'] == item['answer']
-        item['context'] = context[:1000]
+        item['context'] = context[:256] + ' ...'
         if metrics:
             item["ttft_ms"] = metrics.get("ttft_ms")
             item["e2e_ms"] = metrics.get("e2e_ms")
