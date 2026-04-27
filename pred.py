@@ -71,9 +71,11 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
         input_ids = input_ids[:half] + input_ids[-(keep - half):]
         return _decode(input_ids)
 
-    # truncate（以本地配置为上限；预留 chat template 余量；若服务端更小，后面会自动适配）
-    max_len = max(256, maxlen_map[model] - CHAT_TEMPLATE_BUFFER_TOKENS)
-    prompt = _truncate(prompt, max_len)
+    # truncate（以“输入 tokens + 生成 tokens”不超过 max_model_len 为准；预留 chat template 余量）
+    # 否则 vLLM 会直接 400：max_tokens 太大（例如 1024 > max_len - input_tokens）
+    max_model_len = int(maxlen_map[model])
+    max_prompt_len = max(256, max_model_len - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
+    prompt = _truncate(prompt, max_prompt_len)
     tries = 0
     api_model = _api_model_id(model) if model in model_map else model
     while tries < 5:
@@ -105,20 +107,19 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
                     print(f"[server_response] status={status} body={text}")
                 except Exception:
                     pass
-            # vLLM 常见报错：最大上下文长度不足（400），自动把 prompt 截断到服务端上限再重试
-            # 例如：This model's maximum context length is 8192 tokens. However, your request has 120009 input tokens.
+            # vLLM 常见报错：上下文不足（400），自动把 prompt 截断到服务端上限再重试
             err_text = body_text or msg
-            m = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
-            if m:
-                server_limit = int(m.group(1))
-                # 预留 chat template 余量，避免再次越界（无需扣 max_new_tokens：这里只影响 input tokens）
-                new_limit = max(256, server_limit - CHAT_TEMPLATE_BUFFER_TOKENS)
-                if new_limit < max_len:
-                    max_len = new_limit
-                    prompt = _truncate(prompt, max_len)
+            m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
+            if m_ctx:
+                server_limit = int(m_ctx.group(1))
+                # 关键：要扣掉 max_new_tokens（否则仍可能触发“max_tokens 太大”）
+                new_prompt_limit = max(256, server_limit - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
+                if new_prompt_limit < max_prompt_len:
+                    max_prompt_len = new_prompt_limit
+                    prompt = _truncate(prompt, max_prompt_len)
                     print(
                         f"[data] server max context={server_limit}, "
-                        f"auto-truncate to {max_len} (buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
+                        f"auto-truncate prompt to {max_prompt_len} (max_new_tokens={max_new_tokens}, buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
                     )
                     continue
             time.sleep(1)
@@ -163,8 +164,9 @@ def query_llm_streaming(
         input_ids = input_ids[:half] + input_ids[-(keep - half):]
         return _decode(input_ids)
 
-    max_len = max(256, maxlen_map[model] - CHAT_TEMPLATE_BUFFER_TOKENS)
-    prompt = _truncate(prompt, max_len)
+    max_model_len = int(maxlen_map[model])
+    max_prompt_len = max(256, max_model_len - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
+    prompt = _truncate(prompt, max_prompt_len)
 
     api_model = _api_model_id(model) if model in model_map else model
     start = time.perf_counter()
@@ -229,16 +231,16 @@ def query_llm_streaming(
                 except Exception:
                     pass
             err_text = body_text or msg
-            m = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
-            if m:
-                server_limit = int(m.group(1))
-                new_limit = max(256, server_limit - CHAT_TEMPLATE_BUFFER_TOKENS)
-                if new_limit < max_len:
-                    max_len = new_limit
-                    prompt = _truncate(prompt, max_len)
+            m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
+            if m_ctx:
+                server_limit = int(m_ctx.group(1))
+                new_prompt_limit = max(256, server_limit - int(max_new_tokens) - CHAT_TEMPLATE_BUFFER_TOKENS)
+                if new_prompt_limit < max_prompt_len:
+                    max_prompt_len = new_prompt_limit
+                    prompt = _truncate(prompt, max_prompt_len)
                     print(
                         f"[data] server max context={server_limit}, "
-                        f"auto-truncate to {max_len} (buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
+                        f"auto-truncate prompt to {max_prompt_len} (max_new_tokens={max_new_tokens}, buffer={CHAT_TEMPLATE_BUFFER_TOKENS}) and retry"
                     )
                     continue
             time.sleep(1)

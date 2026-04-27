@@ -1,11 +1,8 @@
-![](LongBench/misc/logo.gif)
 # 📚 LongBench v2: Towards Deeper Understanding and Reasoning on Realistic Long-context Multitasks
-<p align="center">
-    🌐 <a href="https://longbench2.github.io" target="_blank">Project Page</a> • 📚 <a href="https://arxiv.org/abs/2412.15204" target="_blank">LongBench v2 Paper</a> • 📊 <a href="https://huggingface.co/datasets/THUDM/LongBench-v2" target="_blank">LongBench v2 Dataset</a> • 𝕏 <a href="https://x.com/realYushiBai/status/1869946577349132766" target="_blank">Thread</a>
-</p>
-<p align="center">
-    📖 <a href="https://arxiv.org/abs/2308.14508" target="_blank">LongBench Paper</a> • 🤗 <a href="https://huggingface.co/datasets/THUDM/LongBench" target="_blank">LongBench Dataset</a>
-</p>
+
+🌐 [Project Page](https://longbench2.github.io) • 📚 [LongBench v2 Paper](https://arxiv.org/abs/2412.15204) • 📊 [LongBench v2 Dataset](https://huggingface.co/datasets/THUDM/LongBench-v2) • 𝕏 [Thread](https://x.com/realYushiBai/status/1869946577349132766)
+
+📖 [LongBench Paper](https://arxiv.org/abs/2308.14508) • 🤗 [LongBench Dataset](https://huggingface.co/datasets/THUDM/LongBench)
 
 **📢 The original LongBench v1 related files are moved under `LongBench/`, read its README [here](LongBench/README.md)**.
 
@@ -15,15 +12,8 @@ To elaborate, LongBench v2 consists of 503 challenging multiple-choice questions
 
 **🔍 With LongBench v2, we are eager to find out how scaling inference-time compute will affect deep understanding and reasoning in long-context scenarios. View our 🏆 leaderboard [here](https://longbench2.github.io/#leaderboard) (updating).**
 
-<div style="text-align: center;">
-  <img src="misc/length.png" width="600" />
-</div>
-
-<div style="text-align: center;">
-  <img src="misc/table.png" width="700" />
-</div>
-
 ## 🔥 Updates
+
 🔥🔥🔥 **[2024/01/15]** More evaluation results added to our [leaderboard](https://longbench2.github.io/#leaderboard), including Gemini-Exp-1206, Gemini-2.0-Flash, DeepSeek-V3, and MiniMax-Text-01, Check them out!
 
 🔥🔥🔥 **[2024/12/20]** We are excited to release **LongBench v2**! Compared to the first generation of LongBench, LongBench v2 is much longer and much more challenging. Its goal is to provide a reliable evaluation standard for the development of future superhuman long-context AI systems.
@@ -31,11 +21,14 @@ To elaborate, LongBench v2 consists of 503 challenging multiple-choice questions
 ## ⚙️ How to evaluate on LongBench v2
 
 ### Load Data
+
 You can download and load the **LongBench v2** data through the Hugging Face datasets ([🤗 HF Repo](https://huggingface.co/datasets/THUDM/LongBench-v2)):
+
 ```python
 from datasets import load_dataset
 dataset = load_dataset('THUDM/LongBench-v2', split='train')
 ```
+
 Alternatively, you can download the file from [this link](https://huggingface.co/datasets/THUDM/LongBench-v2/resolve/main/data.json) to load the data.
 
 ### Data Format
@@ -57,6 +50,7 @@ All data in **LongBench v2** are standardized to the following format:
 ```
 
 ### Evaluation
+
 Install the requirements with pip: `pip install -r requirements.txt`.
 
 To run model evaluation, first add your model path and its context window length to `config/`, then follow these steps (we take [GLM-4-9B-Chat](https://github.com/THUDM/GLM-4) for a running example):
@@ -80,6 +74,7 @@ Once your model is deployed, modify the `URL` and `API_KEY` in `pred.py` to matc
 ```bash
 python pred.py --model GLM-4-9B-Chat
 ```
+
 - `--cot`: Enable evaluation under the Chain-of-Thought (CoT) setting.
 - `--no_context`: Test the model’s performance without the long context (pure memorization).
 - `--rag N`: Use top-N retrieved contexts during +RAG evaluation. This is set to 0 by default to disable RAG. For details on the retrieval process, refer to the [retrieve.py](https://github.com/THUDM/LongCite/blob/main/utils/retrieve.py) file.
@@ -89,6 +84,7 @@ python pred.py --model GLM-4-9B-Chat
 Finally, run `python result.py` to export the evaluation results.
 
 ## 📝 Citation
+
 ```
 @article{bai2024longbench2,
   title={LongBench v2: Towards Deeper Understanding and Reasoning on Realistic Long-context Multitasks}, 
@@ -110,3 +106,4 @@ Finally, run `python result.py` to export the evaluation results.
     pages = "3119--3137",
 }
 ```
+
