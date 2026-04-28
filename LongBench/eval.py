@@ -43,6 +43,12 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
+    parser.add_argument(
+        '--path',
+        type=str,
+        default=None,
+        help='Prediction folder path. If set, overrides pred/<model>/ or pred_e/<model>/',
+    )
     return parser.parse_args(args)
 
 def scorer_e(dataset, predictions, answers, lengths, all_classes):
@@ -77,10 +83,15 @@ def scorer(dataset, predictions, answers, all_classes):
 if __name__ == '__main__':
     args = parse_args()
     scores = dict()
-    if args.e:
-        path = f"pred_e/{args.model}/"
+    if args.path is not None:
+        path = args.path if args.path.endswith("/") else args.path + "/"
     else:
-        path = f"pred/{args.model}/"
+        if args.model is None:
+            raise ValueError("Missing --model when --path is not set. Either pass --model <name> or use --path <pred_dir>.")
+        if args.e:
+            path = f"pred_e/{args.model}/"
+        else:
+            path = f"pred/{args.model}/"
     all_files = os.listdir(path)
     print("Evaluating on:", all_files)
     for filename in all_files:
@@ -102,8 +113,10 @@ if __name__ == '__main__':
             score = scorer(dataset, predictions, answers, all_classes)
         scores[dataset] = score
     if args.e:
-        out_path = f"pred_e/{args.model}/result.json"
+        out_dir = path.rstrip("/")
     else:
-        out_path = f"pred/{args.model}/result.json"
+        out_dir = path.rstrip("/")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "result.json")
     with open(out_path, "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
