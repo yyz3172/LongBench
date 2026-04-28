@@ -405,6 +405,8 @@ def get_pred(data, args, fout):
             _id = item.get("_id")
             print(f"[data] skip item due to prompt budget error: _id={_id} err={e}")
             continue
+        # 客户端侧 token 统计：对 prompt 文本 encode（不含服务端 chat template 额外特殊 token）
+        input_tokens_req1 = _count_tokens_text(prompt, model, tokenizer)
         if args.measure_latency:
             if args.cot:
                 output, metrics = query_llm_streaming(
@@ -425,7 +427,11 @@ def get_pred(data, args, fout):
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
+            output_tokens_req1 = _count_tokens_text(response, model, tokenizer)
+            item["input_tokens_cot"] = input_tokens_req1
+            item["output_tokens_cot"] = output_tokens_req1
             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
+            input_tokens_req2 = _count_tokens_text(prompt, model, tokenizer)
             if args.measure_latency:
                 output, metrics2 = query_llm_streaming(
                     prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128
@@ -438,16 +444,20 @@ def get_pred(data, args, fout):
             item["ttft_ms_cot"] = metrics.get("ttft_ms") if metrics else None
             item["e2e_ms_cot"] = metrics.get("e2e_ms") if metrics else None
             metrics = metrics2
+            item["input_tokens"] = input_tokens_req2
+        else:
+            item["input_tokens"] = input_tokens_req1
         response = output.strip()
         item['response'] = response
         item['pred'] = extract_answer(response)
         item['judge'] = item['pred'] == item['answer']
         item['context'] = context[:256] + ' ...'
+        # 最终一轮回答的 output token（CoT 时为第二段；非 CoT 为唯一一段）
+        out_tok = _count_tokens_text(response, model, tokenizer)
+        item["output_tokens"] = out_tok
         if metrics:
             item["ttft_ms"] = metrics.get("ttft_ms")
             item["e2e_ms"] = metrics.get("e2e_ms")
-            out_tok = _count_tokens_text(response, model, tokenizer)
-            item["output_tokens"] = out_tok
             ttft = metrics.get("ttft_ms")
             e2e = metrics.get("e2e_ms")
             if isinstance(ttft, (int, float)) and isinstance(e2e, (int, float)) and out_tok > 0 and e2e >= ttft:
