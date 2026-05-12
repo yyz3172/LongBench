@@ -17,6 +17,9 @@ from transformers import AutoTokenizer
 # OpenAI-compatible HTTP client (aligned with code/LongBench/pred.py)
 # -----------------------------------------------------------------------------
 
+# 为 chat 模板等与客户端 token 计数偏差预留的固定余量（用于输入上限与总窗口对齐）
+_CONTEXT_RESERVE_TOKENS = 128
+
 
 def _default_base_url() -> str:
     v = os.environ.get("OPENAI_BASE_URL")
@@ -45,6 +48,57 @@ def _count_tokens_text(text: str, tokenizer: Any) -> int:
         return len(tokenizer.encode(text))
     except Exception:
         return 0
+
+
+def _resolve_total_context_tokens(
+    model_key: str, model2path: dict, tokenizer: Any
+) -> Optional[int]:
+    """
+    推理总上下文上限（prompt + 生成），用于钳位 max_tokens，避免超过服务端窗口。
+
+    优先级：model2path[model_key] 字典里的 max_model_len >
+    tokenizer.model_max_length（仅在数值合理时采用，排除 HF 常见的超大哨兵值）。
+    """
+    v = model2path.get(model_key)
+    if isinstance(v, dict):
+        ml = v.get("max_model_len")
+        if ml is not None:
+            try:
+                return int(ml)
+            except (TypeError, ValueError):
+                pass
+    mml = getattr(tokenizer, "model_max_length", None)
+    if mml is None:
+        return None
+    try:
+        n = int(mml)
+    except (TypeError, ValueError):
+        return None
+    # 排除「无限制」类哨兵（常见为 1e30 量级或 int64 极大值）
+    if n <= 0 or n > 1_000_000:
+        return None
+    return n
+
+
+def _effective_input_max_tokens(
+    max_length: int, max_gen: int, total_ctx: Optional[int], reserve: int
+) -> int:
+    """
+    输入侧 token 上限：默认等于 model2maxlen（max_length）。
+    当 max_length + max_gen 超过模型总上下文 total_ctx 时，收紧为
+    total_ctx - max_gen - reserve，使「配置上的最长输入 + 最长输出 + 余量」
+    落在总窗口内；再配合 --overlength 对超长 prompt 跳过或裁 context。
+    total_ctx 未知时不收紧。
+    """
+    L = int(max_length)
+    G = int(max_gen)
+    if total_ctx is None:
+        return L
+    M = int(total_ctx)
+    if L + G <= M:
+        return L
+    cap = M - G - int(reserve)
+    return max(0, min(L, cap))
 
 
 def query_llm_http(
@@ -235,8 +289,10 @@ def parse_args(args=None):
         "--overlength",
         choices=["skip", "truncate_context"],
         default="skip",
-        help="当拼接后的 prompt token 数超过模型上限时的处理策略："
-        "skip=直接跳过该样本；truncate_context=仅裁剪样本里的 {context} 字段以适配上限。",
+        help="当拼接后的 prompt token 数超过「有效输入上限」时的处理："
+        "skip=跳过；truncate_context=仅裁剪样本里的 {context}。"
+        "有效输入上限默认等于 model2maxlen；若其与本数据集 max_gen 之和超过模型总上下文，"
+        "会先收紧输入上限再应用本策略。",
     )
     parser.add_argument(
         "--measure_latency",
@@ -278,12 +334,28 @@ def get_pred(
     api_key = os.environ.get("OPENAI_API_KEY", "token-abc123")
     client = OpenAI(base_url=base_url, api_key=api_key)
 
+    total_ctx = _resolve_total_context_tokens(model_name, model2path, tokenizer)
+    effective_max_length = _effective_input_max_tokens(
+        max_length, max_gen, total_ctx, _CONTEXT_RESERVE_TOKENS
+    )
+    if effective_max_length < max_length:
+        print(
+            f"[pred] worker-{rank}: tighten input token cap {max_length} -> {effective_max_length} "
+            f"(total_ctx={total_ctx}, max_gen={max_gen}, reserve={_CONTEXT_RESERVE_TOKENS})"
+        )
+    if total_ctx is not None and int(max_length) + int(max_gen) > int(total_ctx):
+        if effective_max_length < 1:
+            print(
+                f"[pred] worker-{rank}: warn: effective input cap < 1; "
+                f"most prompts will be skipped unless empty (total_ctx={total_ctx}, max_gen={max_gen})."
+            )
+
     for json_obj in tqdm(data, position=rank, desc=f"worker-{rank}"):
         prompt = _build_prompt_with_overlength_policy(
             prompt_format=prompt_format,
             json_obj=json_obj,
             tokenizer=tokenizer,
-            max_length=max_length,
+            max_length=effective_max_length,
             overlength=overlength,
         )
         if prompt is None:
@@ -291,6 +363,7 @@ def get_pred(
 
         # 客户端侧 token：与 vLLM chat 模板额外 token 不完全一致，仅作近似（同 code/LongBench/pred.py 说明）
         input_tokens = _count_tokens_text(prompt, tokenizer)
+
         temp = 1.0 if dataset == "samsum" else 0.0
 
         if measure_latency:

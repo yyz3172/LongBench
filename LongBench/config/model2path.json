@@ -8,7 +8,8 @@
     "chatglm3-6b-32k": "THUDM/chatglm3-6b-32k",
     "Mistral-7B-Instruct-v0.2": {
         "tokenizer": "/root/autodl-tmp/models/Mistral-7B-Instruct-v0.2",
-        "api_model": "mistral_7b_instruct_v0_2"
+        "api_model": "mistral_7b_instruct_v0_2",
+        "max_model_len": 32768
     },
     "vicuna-v1.5-7b-16k": "lmsys/vicuna-7b-v1.5-16k"
 }
