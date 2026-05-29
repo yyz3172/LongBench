@@ -128,7 +128,7 @@ def query_llm_http(
             raise
         except Exception as e:
             msg = str(e) or repr(e)
-            print(f'Error Occurs: "{msg}"        Retry ...')
+            tqdm.write(f'Error Occurs: "{msg}"        Retry ...')
             resp = getattr(e, "response", None)
             body_text = None
             if resp is not None:
@@ -138,18 +138,18 @@ def query_llm_http(
                     if callable(text):
                         text = text()
                     body_text = text
-                    print(f"[server_response] status={status} body={text}")
+                    tqdm.write(f"[server_response] status={status} body={text}")
                 except Exception:
                     pass
             err_text = body_text or msg
             m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
             if m_ctx:
-                print(
+                tqdm.write(
                     f"[data] server max context={int(m_ctx.group(1))}; prompt still exceeds limit. Skip."
                 )
                 return ""
             time.sleep(1)
-    print("Max tries. Failed.")
+    tqdm.write("Max tries. Failed.")
     return ""
 
 
@@ -213,7 +213,7 @@ def query_llm_http_streaming(
             raise
         except Exception as e:
             msg = str(e) or repr(e)
-            print(f'Error Occurs: "{msg}"        Retry ...')
+            tqdm.write(f'Error Occurs: "{msg}"        Retry ...')
             resp = getattr(e, "response", None)
             body_text = None
             if resp is not None:
@@ -223,13 +223,13 @@ def query_llm_http_streaming(
                     if callable(text):
                         text = text()
                     body_text = text
-                    print(f"[server_response] status={status} body={text}")
+                    tqdm.write(f"[server_response] status={status} body={text}")
                 except Exception:
                     pass
             err_text = body_text or msg
             m_ctx = re.search(r"maximum context length is\s+(\d+)\s+tokens", err_text)
             if m_ctx:
-                print(
+                tqdm.write(
                     f"[data] server max context={int(m_ctx.group(1))}; prompt still exceeds limit. Skip."
                 )
                 return "", {"ttft_ms": None, "e2e_ms": None}
@@ -445,7 +445,7 @@ def _build_prompt_with_overlength_policy(
         prompt = prompt_format.format(**json_obj)
     except KeyError as e:
         # 数据字段缺失，跳过
-        print(f"[data] missing field {e} in sample keys={list(json_obj.keys())}")
+        tqdm.write(f"[data] missing field {e} in sample keys={list(json_obj.keys())}")
         return None
 
     # 先算当前 prompt 的 token 长度
