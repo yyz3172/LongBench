@@ -331,7 +331,14 @@ def get_pred(
     effective_max_length: int,
     write_lock: threading.Lock,
 ):
-    for json_obj in tqdm(data, desc=f"worker-{rank}"):
+    for json_obj in tqdm(
+        data,
+        desc=f"worker-{rank}",
+        position=rank,
+        leave=True,
+        total=len(data),
+        dynamic_ncols=False,
+    ):
         prompt = _build_prompt_with_overlength_policy(
             prompt_format=prompt_format,
             json_obj=json_obj,
@@ -545,6 +552,8 @@ if __name__ == "__main__":
         api_key=os.environ.get("OPENAI_API_KEY", "token-abc123"),
     )
     write_lock = threading.Lock()
+    # 多线程各自 tqdm 时，用全局锁串行化终端刷新，配合 position=rank 各占一行
+    tqdm.set_lock(threading.RLock())
     if args.e:
         datasets = [
             "qasper",
@@ -656,3 +665,4 @@ if __name__ == "__main__":
             ]
             for fut in as_completed(futures):
                 fut.result()
+        print()
