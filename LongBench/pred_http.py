@@ -4,12 +4,13 @@ import argparse
 import time
 import re
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
-import torch.multiprocessing as mp
 from openai import OpenAI
 from transformers import AutoTokenizer
 
@@ -275,7 +276,7 @@ def parse_args(args=None):
         "--n_proc",
         type=int,
         default=max(1, min(16, (os.cpu_count() or 4))),
-        help="Parallel worker processes (HTTP); does not require local GPUs.",
+        help="Parallel worker threads (HTTP); does not require local GPUs.",
     )
     parser.add_argument(
         "--data_path",
@@ -316,41 +317,21 @@ def post_process(response, model_name):
 def get_pred(
     rank,
     data,
-    max_length,
     max_gen,
     prompt_format,
     dataset,
     model_name,
-    model2path,
     out_path,
     measure_latency: bool,
     overlength: str,
+    *,
+    tokenizer: Any,
+    client: OpenAI,
+    api_model: str,
+    effective_max_length: int,
+    write_lock: threading.Lock,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(
-        _tokenizer_path(model_name, model2path), trust_remote_code=True
-    )
-    api_model = _api_model_id(model_name, model2path)
-    base_url = _default_base_url()
-    api_key = os.environ.get("OPENAI_API_KEY", "token-abc123")
-    client = OpenAI(base_url=base_url, api_key=api_key)
-
-    total_ctx = _resolve_total_context_tokens(model_name, model2path, tokenizer)
-    effective_max_length = _effective_input_max_tokens(
-        max_length, max_gen, total_ctx, _CONTEXT_RESERVE_TOKENS
-    )
-    if effective_max_length < max_length:
-        print(
-            f"[pred] worker-{rank}: tighten input token cap {max_length} -> {effective_max_length} "
-            f"(total_ctx={total_ctx}, max_gen={max_gen}, reserve={_CONTEXT_RESERVE_TOKENS})"
-        )
-    if total_ctx is not None and int(max_length) + int(max_gen) > int(total_ctx):
-        if effective_max_length < 1:
-            print(
-                f"[pred] worker-{rank}: warn: effective input cap < 1; "
-                f"most prompts will be skipped unless empty (total_ctx={total_ctx}, max_gen={max_gen})."
-            )
-
-    for json_obj in tqdm(data, position=rank, desc=f"worker-{rank}"):
+    for json_obj in tqdm(data, desc=f"worker-{rank}"):
         prompt = _build_prompt_with_overlength_policy(
             prompt_format=prompt_format,
             json_obj=json_obj,
@@ -400,23 +381,21 @@ def get_pred(
         ):
             tpot_ms = (e2e - ttft) / output_tokens
 
-        with open(out_path, "a", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "pred": pred,
-                    "answers": json_obj["answers"],
-                    "all_classes": json_obj["all_classes"],
-                    "length": json_obj["length"],
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "ttft_ms": ttft,
-                    "e2e_ms": e2e,
-                    "tpot_ms": tpot_ms,
-                },
-                f,
-                ensure_ascii=False,
-            )
-            f.write("\n")
+        record = {
+            "pred": pred,
+            "answers": json_obj["answers"],
+            "all_classes": json_obj["all_classes"],
+            "length": json_obj["length"],
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "ttft_ms": ttft,
+            "e2e_ms": e2e,
+            "tpot_ms": tpot_ms,
+        }
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with write_lock:
+            with open(out_path, "a", encoding="utf-8") as f:
+                f.write(line)
 
 
 def seed_everything(seed):
@@ -549,7 +528,6 @@ def _try_load_dataset_local(data_dir: str, dataset: str, is_e: bool) -> Optional
 if __name__ == "__main__":
     seed_everything(42)
     args = parse_args()
-    mp.set_start_method("spawn", force=True)
 
     cfg_dir = os.path.join(os.path.dirname(__file__), "config")
     model2path = json.load(open(os.path.join(cfg_dir, "model2path.json"), "r"))
@@ -557,6 +535,16 @@ if __name__ == "__main__":
 
     model_name = args.model
     max_length = model2maxlen[model_name]
+    print(f"[pred] loading tokenizer for {model_name} ...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        _tokenizer_path(model_name, model2path), trust_remote_code=True
+    )
+    api_model = _api_model_id(model_name, model2path)
+    client = OpenAI(
+        base_url=_default_base_url(),
+        api_key=os.environ.get("OPENAI_API_KEY", "token-abc123"),
+    )
+    write_lock = threading.Lock()
     if args.e:
         datasets = [
             "qasper",
@@ -627,26 +615,44 @@ if __name__ == "__main__":
             out_path = os.path.join(base_out, f"pred/{dataset}.jsonl")
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
+        total_ctx = _resolve_total_context_tokens(model_name, model2path, tokenizer)
+        effective_max_length = _effective_input_max_tokens(
+            max_length, max_gen, total_ctx, _CONTEXT_RESERVE_TOKENS
+        )
+        if effective_max_length < max_length:
+            print(
+                f"[pred] {dataset}: tighten input token cap {max_length} -> {effective_max_length} "
+                f"(total_ctx={total_ctx}, max_gen={max_gen}, reserve={_CONTEXT_RESERVE_TOKENS})"
+            )
+        if total_ctx is not None and int(max_length) + int(max_gen) > int(total_ctx):
+            if effective_max_length < 1:
+                print(
+                    f"[pred] {dataset}: warn: effective input cap < 1; "
+                    f"most prompts will be skipped unless empty "
+                    f"(total_ctx={total_ctx}, max_gen={max_gen})."
+                )
+
         data_subsets = [data_all[i::n_proc] for i in range(n_proc)]
-        processes = []
-        for rank in range(n_proc):
-            p = mp.Process(
-                target=get_pred,
-                args=(
+        with ThreadPoolExecutor(max_workers=n_proc) as executor:
+            futures = [
+                executor.submit(
+                    get_pred,
                     rank,
                     data_subsets[rank],
-                    max_length,
                     max_gen,
                     prompt_format,
                     dataset,
                     model_name,
-                    model2path,
                     out_path,
                     args.measure_latency,
                     args.overlength,
-                ),
-            )
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+                    tokenizer=tokenizer,
+                    client=client,
+                    api_model=api_model,
+                    effective_max_length=effective_max_length,
+                    write_lock=write_lock,
+                )
+                for rank in range(n_proc)
+            ]
+            for fut in as_completed(futures):
+                fut.result()
